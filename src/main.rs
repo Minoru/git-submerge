@@ -1,10 +1,11 @@
 #[macro_use]
 extern crate clap;
-extern crate git2;
 
-use git2::{Commit, Index, Oid, Repository, Revwalk, Tree};
+use git2::{Commit, Index, Oid, Repository, Revwalk, Sort, Tree, TreeBuilder};
+use ini::Ini;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 
 #[macro_use]
 mod macros;
@@ -90,7 +91,6 @@ fn real_main() -> i32 {
     // - submodules have .git in their root directory;
     // - there's .gitmodules in the root of the repo.
     remove_dotgit_from_submodule(&submodule_dir);
-    remove_gitmodules();
     // Git used to think of submodule's directory as a file, because it was
     // "opaque". We have to update the index in order for Git to realise
     // that the submodule directory is *just* a directory now.
@@ -248,11 +248,33 @@ fn get_submodule_revwalk<'repo>(repo: &'repo Repository, submodule_dir: &str) ->
     // "Topological" and reverse means "parents are always visited before their children".
     // We need that in order to be sure that our old-to-new-ids map always contains everything we
     // need it to contain.
-    revwalk.set_sorting(git2::SORT_REVERSE | git2::SORT_TOPOLOGICAL);
-    // TODO (#6): push all branches and tags, not just HEAD
+    revwalk
+        .set_sorting(Sort::REVERSE | Sort::TOPOLOGICAL)
+        .expect("Couldn't set sorting");
     revwalk
         .push(submodule_head)
         .expect("Couldn't add submodule's HEAD to RevWalk");
+
+    let submodule_repo = submodule.open().expect("Couldn't open submodule's repo");
+    let submodule_branches = submodule_repo
+        .branches(None)
+        .expect("Couldn't read submodule's branch list");
+    for branch in submodule_branches {
+        let (branch, _) = branch.expect("Couldn't read submodule's branch");
+        if let Some(branch_oid) = branch.get().target() {
+            revwalk
+                .push(branch_oid)
+                .expect("Couldn't add submodule's branch to RevWalk");
+        }
+    }
+    submodule_repo
+        .tag_foreach(|tag_oid, _| {
+            revwalk
+                .push(tag_oid)
+                .expect("Couldn't add submodule's branch to RevWalk");
+            true
+        })
+        .expect("Couldn't read submodule tags");
 
     revwalk
 }
@@ -262,7 +284,7 @@ fn fetch_submodule_history(repo: &Repository, submodule_dir: &str) -> Result<(),
     let mut remote = repo
         .remote_anonymous(&submodule_url)
         .expect("Couldn't create an anonymous remote");
-    match remote.fetch(&[], None, None) {
+    match remote.fetch(&Vec::<&str>::new(), None, None) {
         Ok(_) => Ok(()),
         Err(_) => {
             eprintln!(
@@ -443,7 +465,9 @@ fn get_repo_revwalk<'repo>(repo: &'repo Repository) -> Revwalk<'repo> {
     let mut revwalk = repo
         .revwalk()
         .expect("Couldn't obtain RevWalk object for the repo");
-    revwalk.set_sorting(git2::SORT_REVERSE | git2::SORT_TOPOLOGICAL);
+    revwalk
+        .set_sorting(Sort::REVERSE | Sort::TOPOLOGICAL)
+        .expect("Couldn't set sorting");
     let head = repo.head().expect("Couldn't obtain repo's HEAD");
     let head_id = head
         .target()
@@ -623,11 +647,14 @@ fn rewrite_repo_history(
                 let parents = {
                     let mut p: Vec<Commit> = Vec::new();
                     for parent_id in commit.parent_ids() {
-                        let actual_parent_id = old_id_to_new[&parent_id];
-                        let parent = repo
-                            .find_commit(actual_parent_id)
-                            .expect("Couldn't find parent commit by its id");
-                        p.push(parent);
+                        if let Some(actual_parent_id) = old_id_to_new.get(&parent_id) {
+                            let parent = repo
+                                .find_commit(*actual_parent_id)
+                                .expect("Couldn't find parent commit by its id");
+                            p.push(parent);
+                            //} else {
+                            //    panic!("Unable to find parent id {} for commit {}", parent_id, commit.id());
+                        }
                     }
 
                     if submodule_updated {
@@ -681,6 +708,109 @@ fn rewrite_repo_history(
     }
 }
 
+fn update_gitmodules<'repo>(
+    repo: &'repo Repository,
+    treebuilder: &mut TreeBuilder,
+    tree: &Tree,
+    submodule_path: &Path,
+) {
+    if let Some(gitmodules) = tree.get_name(".gitmodules") {
+        let blob = gitmodules
+            .to_object(repo)
+            .expect("Couldn't retrieve .gitmodules")
+            .peel_to_blob()
+            .expect("Couldn't retrieve .gitmodules blob");
+
+        let mut blob_content = Cursor::new(blob.content());
+        let mut gitmodules_ini =
+            Ini::read_from(&mut blob_content).expect("Couldn't read .gitmodules blob");
+        gitmodules_ini.delete(Some(format!(
+            "submodule \"{}\"",
+            submodule_path
+                .file_name()
+                .expect("Couldn't get submodule basename")
+                .to_str()
+                .expect("Couldn't convert submodule path to String")
+        )));
+
+        if !gitmodules_ini.is_empty() {
+            let mut buf: Vec<u8> = vec![];
+            gitmodules_ini
+                .write_to(&mut buf)
+                .expect("Couldn't write .gitmodules to buffer");
+            let blob_oid = repo
+                .blob(&buf)
+                .expect("Couldn't write .gitmodules blob to repo");
+            treebuilder
+                .insert(".gitmodules", blob_oid, gitmodules.filemode())
+                .expect("Couldn't add .gitmodules to TreeBuilder");
+        } else {
+            treebuilder
+                .remove(".gitmodules")
+                .expect("Couldn't remove .gitmodules from TreeBuilder");
+        }
+    }
+}
+
+fn replace_tree_subdir<'repo>(
+    repo: &'repo Repository,
+    treebuilder: &mut TreeBuilder,
+    tree: &Tree,
+    submodule_path: &Path,
+    subtree_id: &Oid,
+) -> Oid {
+    let mut submodule_path_segments: Vec<_> = submodule_path
+        .ancestors()
+        .map(|x| x.file_name())
+        .filter_map(|x| x)
+        .map(|x| {
+            x.to_str()
+                .expect("Couldn't convert submodule path segment to String")
+        })
+        .collect::<Vec<_>>();
+    let submodule_path_segment = submodule_path_segments
+        .pop()
+        .expect("Submodule path shouldn't be empty");
+    submodule_path_segments.reverse();
+    let (segment_oid, filemode) = if !submodule_path_segments.is_empty() {
+        let submodule_path_descendants = submodule_path_segments
+            .into_iter()
+            .fold(PathBuf::new(), |acc, x| acc.join(x));
+        let subtree_entry = tree
+            .get_name(submodule_path_segment)
+            .expect("Couldn't find submodule path segment in Tree");
+        let subtree = subtree_entry
+            .to_object(repo)
+            .expect("Couldn't convert TreeEntry to Object")
+            .peel_to_tree()
+            .expect("Couldn't convert Object to Tree");
+        let mut subtreebuilder = repo
+            .treebuilder(Some(&subtree))
+            .expect("Couldn't create TreeBuilder");
+        (
+            replace_tree_subdir(
+                repo,
+                &mut subtreebuilder,
+                &subtree,
+                submodule_path_descendants.as_path(),
+                subtree_id,
+            ),
+            subtree_entry.filemode(),
+        )
+    } else {
+        (*subtree_id, 0o040000)
+    };
+    treebuilder
+        .remove(submodule_path_segment)
+        .expect("Couldn't remove submodule path from TreeBuilder");
+    treebuilder
+        .insert(submodule_path_segment, segment_oid, filemode)
+        .expect("Couldn't add submodule as a subdir to TreeBuilder");
+    treebuilder
+        .write()
+        .expect("Couldn't write TreeBuilder into a Tree")
+}
+
 fn replace_submodule_dir<'repo>(
     repo: &'repo Repository,
     tree: &Tree,
@@ -690,21 +820,10 @@ fn replace_submodule_dir<'repo>(
     let mut treebuilder = repo
         .treebuilder(Some(&tree))
         .expect("Couldn't create TreeBuilder");
+    update_gitmodules(repo, &mut treebuilder, tree, submodule_path);
 
-    treebuilder
-        .remove(submodule_path)
-        .expect("Couldn't remove submodule path from TreeBuilder");
-    treebuilder
-        .insert(submodule_path, *subtree_id, 0o040000)
-        .expect("Couldn't add submodule as a subdir to TreeBuilder");
+    let new_tree_id = replace_tree_subdir(repo, &mut treebuilder, tree, submodule_path, subtree_id);
 
-    treebuilder
-        .remove(".gitmodules")
-        .expect("Couldn't remove .gitmodules from TreeBuilder");
-
-    let new_tree_id = treebuilder
-        .write()
-        .expect("Couldn't write TreeBuilder into a Tree");
     let new_tree = repo
         .find_tree(new_tree_id)
         .expect("Couldn't read back the Tree we just wrote");
@@ -715,11 +834,6 @@ fn replace_submodule_dir<'repo>(
 fn remove_dotgit_from_submodule(submodule_dir: &str) {
     let dotgit_path = String::from(submodule_dir) + "/.git";
     std::fs::remove_file(&dotgit_path).expect(&format!("Couldn't remove {}", dotgit_path));
-}
-
-fn remove_gitmodules() {
-    let gitmodules_path = ".gitmodules";
-    std::fs::remove_file(&gitmodules_path).expect("Couldn't remove .gitmodules");
 }
 
 fn update_index(repo: &Repository, old_id_to_new: &HashMap<Oid, Oid>) {
