@@ -7,10 +7,12 @@ repository = "https://github.com/Minoru/git-submerge"
 readme = "README.markdown"
 license = "BSD-3-Clause"
 build = "build.rs"
+edition = "2018"
 
 [dependencies]
-git2 = "0.6.6"
 clap = "2.24.2"
+git2 = "0.13.7"
+rust-ini = "0.16.1"
 
 [build-dependencies]
 rustc_version = "0.2"
